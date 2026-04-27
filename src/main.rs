@@ -18,6 +18,7 @@ use awc::{
 };
 use clap::Parser;
 use futures_util::StreamExt;
+use log::{debug, info};
 
 use crate::tokens::{Token, TokensBalencer};
 
@@ -32,6 +33,7 @@ struct State {
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let args: args::Args = args::Args::parse();
     let tokens: Vec<Token> = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -74,6 +76,10 @@ async fn default(
     body: String,
     state: Data<State>,
 ) -> HttpResponse {
+    let peer = req.peer_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+    info!("[INCOMING] {} {} from {}", req.method(), req.uri(), peer);
+    debug!("[INCOMING] headers: {:?}", req.headers());
+    debug!("[INCOMING] body: {}", body);
     #[cfg(feature = "auth")]
     {
         let token_result: Result<(), &str> = req
@@ -91,6 +97,7 @@ async fn default(
             });
 
         if let Err(_) = token_result {
+            info!("[RESPONSE] 401 Unauthorized");
             return HttpResponse::Unauthorized()
                 .insert_header(header::ContentType(mime::APPLICATION_JSON))
                 .body(
@@ -104,6 +111,7 @@ async fn default(
             match balancer.next() {
                 Some(t) => t,
                 None => {
+                    info!("[RESPONSE] 503 No more tokens");
                     return HttpResponse::ServiceUnavailable()
                     .insert_header(header::ContentType(mime::APPLICATION_JSON))
                     .body(r#"{"error":{"code":503,"message":"No more tokens"}}"#);
@@ -111,15 +119,18 @@ async fn default(
             }
         }
         Err(_) => {
+            info!("[RESPONSE] 500 Unable to lock the tokens balancer");
             return HttpResponse::InternalServerError()
                 .insert_header(header::ContentType(mime::APPLICATION_JSON))
                 .body(r#"{"error":{"code":500,"message":"Unable to lock the tokens balancer"}}"#);
         }
     };
 
+    let target_url = format!("{BASE_URL}{}", req.uri());
+    debug!("[OPENROUTER] request body: {}", body);
     let mut result: ClientResponse<_> = match state
         .client
-        .request_from(format!("{BASE_URL}{}", req.uri()), req.head())
+        .request_from(&target_url, req.head())
         .insert_header((
             header::AUTHORIZATION,
             format!("Bearer {}", token.token),
@@ -127,8 +138,13 @@ async fn default(
         .send_body(body)
         .await
     {
-        Ok(r) => r,
+        Ok(r) => {
+            info!("[OPENROUTER] {} {} -> {} (token: {})", req.method(), target_url, r.status(), token.name);
+            debug!("[OPENROUTER] response headers: {:?}", r.headers());
+            r
+        }
         Err(e) => {
+            info!("[OPENROUTER] {} {} -> error: {}", req.method(), target_url, e);
             return HttpResponse::InternalServerError()
                 .insert_header(header::ContentType(mime::APPLICATION_JSON))
                 .body(format!(
@@ -169,6 +185,7 @@ async fn default(
     }
 
     if is_chunked || is_sse {
+        info!("[RESPONSE] {} {} (streaming)", status, req.uri());
         let stream = result.map(move |chunk_result| {
             chunk_result.map_err(|e| {
                 actix_web::error::ErrorInternalServerError(format!(
@@ -182,6 +199,7 @@ async fn default(
         let body = match result.body().await {
             Ok(b) => b,
             Err(e) => {
+                info!("[RESPONSE] 500 body read error: {}", e);
                 return HttpResponse::InternalServerError()
                     .insert_header(header::ContentType(mime::APPLICATION_JSON))
                     .body(format!(
@@ -190,6 +208,8 @@ async fn default(
                     ));
             }
         };
+        info!("[RESPONSE] {} {}", status, req.uri());
+        debug!("[RESPONSE] body: {}", String::from_utf8_lossy(&body));
         response.body(body)
     }
 }
