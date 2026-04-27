@@ -18,7 +18,7 @@ use awc::{
 };
 use clap::Parser;
 use futures_util::StreamExt;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::tokens::{Token, TokensBalencer};
 
@@ -186,13 +186,28 @@ async fn default(
 
     if is_chunked || is_sse {
         info!("[RESPONSE] {} {} (streaming)", status, req.uri());
+        let uri = req.uri().to_string();
         let stream = result.map(move |chunk_result| {
-            chunk_result.map_err(|e| {
-                actix_web::error::ErrorInternalServerError(format!(
-                    "Stream error: {}",
-                    e
-                ))
-            })
+            chunk_result
+                .map(|chunk| {
+                    if is_sse {
+                        if let Ok(text) = std::str::from_utf8(&chunk) {
+                            for line in text.lines() {
+                                let data = line.strip_prefix("data: ").unwrap_or(line);
+                                if data.starts_with('{') && data.contains("\"error\":") {
+                                    warn!("[STREAM] {} mid-stream error: {}", uri, data);
+                                }
+                            }
+                        }
+                    }
+                    chunk
+                })
+                .map_err(|e| {
+                    actix_web::error::ErrorInternalServerError(format!(
+                        "Stream error: {}",
+                        e
+                    ))
+                })
         });
         response.streaming(stream)
     } else {
